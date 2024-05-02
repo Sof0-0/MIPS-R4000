@@ -1,0 +1,1030 @@
+#TOTAL: 28.5 hours 
+
+"""
+# TIMELINE right now: we are about to add stages to the main while loop
+
+# SIMPLE PRINT IS WORKING NOW
+
+#------- SOME MODIFICATIONS ON THE DECODER:
+#   1. rewrite the decode and add the new function to make it store data and output string (two new lists) for each instruction
+#   2. rather than processing the whole thing right away
+#   3. go through the data and through the output_str and return the output for the instr object 
+
+
+# Maintain 3 lists in the decoder: instr list, data_output_list (parsed string), data_num_lists(which stores the actual signed values)
+#output str = list1 + list2 + list3
+#^^^^^ All of this is to utilize the decoder for the simulator 
+
+# Basically we wil have list of instruction objects from the decode stage;
+# each instruction object will have rs, rd, opcode (kind of like in the decoder);
+# the loop (main loop) will work as long as there are instruction in the list.
+
+
+# PRORGRESS today: building in stage carry vars to have set vars for rach stage
+# UPDATE (major) today: integrate output per cycle with the main loop
+
+TODO: update output_curr_cycle to print loop_pipe_st and not stage_carry!
+^^^ and what about other parts of print? (not just pipe_st to be printed properly)
+
+
+# 1. fix my output_current cycle to add the "capture_pipe_status"
+# 2. add the "update" in the beginning of the launch  to the Instruction class
+3. in the output we then just call on stage_carry and no need in loop_state
+4. UPDATE THE MAIN LOOP BY ADDING PC TO THE INSTRUCTION AND DOING WHILE PC == NONE
+
+"""
+
+# change the decoder to automatically store in the instruction fields (to the instruction object from the decoder)
+from dis_risc_5 import read_file, decode_whole_file_lines, write_file, get_output_str_list
+from ctypes import c_uint32 as u
+import numpy as np
+
+
+# **************************************
+# CLASSES IMPLEMENTED BELOW:
+
+# implement class instruction to store imm, src1, src2, dest, opcode 
+class Instruction:
+        
+        # the ones that are not set to default value have to be assigned! (mandatory) 
+        # the ones where the default is specified, they could be overwritten if they are actually initialized to some value in the decoder
+
+        def __init__(self, type, opcode, rd = None, rs1 = None, rs2 = None, imm = None, code_out = ''):
+            self.ins_parts_list = [] # to store assembly parts in the list (from dis code)
+            code_replace_ins = code_out.replace('\t', ' ')
+            self.code_out = code_replace_ins  #figure out what is this????
+            self.total_output_str = None # for further printing of the whole binary (decoded) string rigth away (after list is converted to string)
+            
+            self.type = type         # I or R
+            self.opcode = opcode
+            self.rd = rd
+            self.rs1 = rs1
+            self.rs2 = rs2
+            self.imm = imm
+            self.magic_address = 0   # instruction's address (actual physical address)
+
+            #self.forw_source = [] # [{ 'src' : instr.object}, 'stage': EX}]
+            #self.forw_dest = [] # [{ 'src' : instr.object}, 'stage': EX}]
+
+
+# implement memory class to initialize memory (), perform store and load functions
+class Memory:
+
+     def __init__(self, data_start_address, flag_init_data = None):
+         self.data_address_start = data_start_address                 # data region starts at location 600
+         self.data = [0] * (1000 - self.data_address_start)           # assign 0s to those memory locations (600-1000)
+
+         if flag_init_data:                                                              # if the flag to initialize data is set (there is some data in memory)                
+               for i, data in enumerate(flag_init_data): self.data[i] = data            # flag_init_data is the data_memory we are passing 
+                    
+     # here we will perform some logical/physical address manipulation (treat all addresses in self.data as logical) and 
+     # find the correct value in self.data using actual "physical address" from the decoder (from 600-1000)
+
+     def load(self, phys_address): 
+        logic_address = phys_address - self.data_address_start
+        return self.data[logic_address//4]
+    
+     def store(self, value, phys_address):
+        logic_address = phys_address - self.data_address_start
+        self.data[logic_address//4] = value
+
+"""
+     As it was discovered throughout the testing, it is easier to carry the 
+     variables between stages rather than calling on separate initializer functions
+     all the time. 
+
+     -- SOLUTION: create the Carry_Stage class with all initializers to just
+     call on the class instances with inherited methods. 
+
+"""
+class Carry_Stage:
+     # class is defined to carry over all variables btw stages
+     def __init__(self, data_list, pc_start = 496, data_memory_start = 600):
+          self.out_pipeline_st = self.pipeline_st_init()
+          self.out_current_pc = None
+          self.out_stall_ins = None
+          self.out_forw_st = self.forwarding_st_init()
+          self.out_pipeline_regs = self.pipeline_regs_init()
+          self.out_pipeline_regs['IF/IS.NPC'] = pc_start
+          self.out_int_regs = [0] * 32
+          self.out_tot_stalls = self.total_stalls_init()
+          self.out_tot_forw = self.total_forw_init()
+          self.memory = Memory(data_memory_start, flag_init_data = data_list) 
+          self.out_cycle_count = 0
+
+     # **************************************
+     # INITIALIZATION FUNCTIONS IMPLEMENTED BELOW (OUTPUT):
+
+     # initialize pipeline status (PRINT 2)
+     # for each pipeline stage, the output will be shown after the results of the next cycle!
+     # whereas each stage itself takes the instruction object from the previous stage, processes it, and either stalls
+     # the next register for the following stage or updates it
+
+
+     def pipeline_st_init(self):
+          pipeline_st = dict() #if not none - reset it
+          pipeline_st['IF'] = None    # always <unknown>
+          pipeline_st['IS'] = None    # must be a binary string (the hex value is given in the output)
+          pipeline_st['ID'] = None    # INSTRUCTION OBJECT (NOP) 
+          pipeline_st['RF'] = None    # INSTRUCTION OBJECT (NOP)
+          pipeline_st['EX'] = None    # INSTRUCTION OBJECT (NOP)
+          pipeline_st['DF'] = None    # INSTRUCTION OBJECT (NOP)
+          pipeline_st['DS'] = None    # INSTRUCTION OBJECT (NOP)
+          pipeline_st['WB'] = None    # INSTRUCTION OBJECT (NOP)
+
+          return pipeline_st
+     
+     # initialize forwarding status between pipeline regs (PRINT 4)
+     def forwarding_st_init(self):
+
+          # If not none: then print (Instruction_obj1) "to" (Instruction_obj2) 
+          # To get those instr_obj just call on the output string of instr.obj (for the output)
+          # Then we can create forwarding registers (that will be checked before each stage is moved) and get the actual values from there (of instr_1 to instr_2)
+
+          forw_st = dict() #if not none - reset it
+          forw_st['Detected'] = None                   # If not none: then print (Instruction_obj1) "to" (Instruction_obj2) 
+          forw_st['EX/DF -> RF/EX'] = None   
+          forw_st['DF/DS -> EX/DF'] = None  
+          forw_st['DF/DS -> RF/EX'] = None  
+          forw_st['DS/WB -> EX/DF'] = None  
+          forw_st['DS/WB -> RF/EX'] = None   
+
+          return forw_st
+
+
+     # assign the new vars to the stage_carry vars
+     # so do not have to nest the forwarding_st_init
+     def assign_forw_st(self):
+          self.out_forw_st = self.forwarding_st_init()
+
+     # initialize pipeline regs (PRINT 5)
+     def pipeline_regs_init(self):
+          pipeline_regs = dict() #if not none - reset it
+          pipeline_regs['IF/IS.NPC'] = 0             # next pointer (starts with 500)
+          pipeline_regs['IS/ID.IR'] = 0                # binary code for the next ins before ID (like in IS stage)
+          pipeline_regs['RF/EX.A'] = 0                 # input of A in EX stage
+          pipeline_regs['RF/EX.B'] = 0                 # input of B in EX stage
+          pipeline_regs['EX/DF.ALUout'] = 0            # output of EX stage for ALU 
+          pipeline_regs['EX/DF.B'] = 0                 # output of EX stage for branching
+          pipeline_regs['DF.ALUout/DS'] = 0            # extra pipeline reg to send DF.ALUout  (NOT SHOWN IN OUTPUT)
+          pipeline_regs['DF.Extra/DS'] = 0             # extra pipeline reg to send DF.B       (NOT SHOWN IN OUTPUT)
+          pipeline_regs['DS/WB.ALUout-LMD'] = 0        # data loaded from memory
+
+          return pipeline_regs
+     
+     # initialize totall stalls (PRINT 8)
+     def total_stalls_init(self):
+
+          total_stalls = dict()
+          total_stalls['Loads'] = 0
+          total_stalls['Branches'] = 0
+          total_stalls['Other'] = 0
+
+          return total_stalls
+     
+     # initialize totall forwarding (PRINT 9)
+     def total_forw_init(self):
+
+          total_forw = dict()
+          total_forw['EX/DF -> RF/EX'] = 0
+          total_forw['DF/DS -> EX/DF'] = 0
+          total_forw['DF/DS -> RF/EX'] = 0
+          total_forw['DS/WB -> EX/DF'] = 0
+          total_forw['DS/WB -> RF/EX'] = 0
+          
+          return total_forw
+     
+     # END OF INITIALIZATION FUNCTIONS
+     # **************************************
+     
+     # **************************************
+     # HELPER FUNCTIONS IMPLEMENTED BELOW (OUTPUT):
+     
+     # the function is needed for the main while loop in 'launch_sim()'
+     def is_empty(self):
+     
+          pipeline_st = self.out_pipeline_st
+
+          # check if each stage is empty or not
+          if (pipeline_st['IF'] is not None): return False
+          elif (pipeline_st['IS'] is not None): return False
+          elif (pipeline_st['ID'] is not None): return False
+          elif (pipeline_st['RF'] is not None): return False
+          elif (pipeline_st['EX'] is not None): return False
+          elif (pipeline_st['DF'] is not None): return False
+          elif (pipeline_st['DS'] is not None): return False
+          elif (pipeline_st['WB'] is not None): return False
+          else: return True
+
+     def hazard_UNIT(self):
+          check_this_flag_second = False # make sure it's the one in ID stage
+          possible_h_ID = self.out_pipeline_st['ID']
+
+          # here for the instructions we will always include 2 stalls (also have to consider 1 stall if SW and LW)
+          if (not self.out_pipeline_st['DF']) or self.out_pipeline_st['DF'].opcode != 'LW': pass
+          else: 
+               possible_h_EX = self.out_pipeline_st['DF']
+               if (possible_h_ID.type == 'R' or possible_h_ID.type == 'B') and (possible_h_ID.rs1 == possible_h_EX.rd or possible_h_ID.rs2 == possible_h_EX.rd):check_this_flag_second = True
+               if (possible_h_ID.type == 'I' or possible_h_ID.type == 'S') and possible_h_ID.rs1 == possible_h_EX.rd:check_this_flag_second = True
+
+          # going to be resolved here
+          # these cases below are used where 1 stall is installed
+          if (not self.out_pipeline_st['EX']) or self.out_pipeline_st['EX'].opcode != 'LW': pass
+          else: 
+               possible_h_RF = self.out_pipeline_st['EX']
+               if (possible_h_ID.type == 'R' or possible_h_ID.type == 'B' or possible_h_ID.type == 'S') and  (possible_h_ID.rs1 == possible_h_RF.rd or possible_h_ID.rs2 == possible_h_RF.rd):check_this_flag_second = True
+               if (possible_h_ID.type == 'I') and possible_h_ID.rs1 == possible_h_RF.rd: check_this_flag_second = True
+
+          return check_this_flag_second
+     
+     # just say if the branch/jump is taken 
+     def if_taken(self, ex_A, ex_B):
+          check_this_flag_first = False
+          potential_jump_EX = self.out_pipeline_st['EX']
+          if potential_jump_EX.type == 'J' or potential_jump_EX.opcode == 'JALR': check_this_flag_first = True
+          elif potential_jump_EX.opcode == 'BEQ' and ex_A == ex_B: check_this_flag_first = True
+          elif potential_jump_EX.opcode == 'BNE' and ex_A != ex_B: check_this_flag_first = True
+          elif potential_jump_EX.opcode == 'BGE' and ex_A >= ex_B: check_this_flag_first = True
+          elif potential_jump_EX.opcode == 'BLT' and ex_A < ex_B: check_this_flag_first = True
+          return check_this_flag_first
+     
+
+
+     # START OF FORWARDING FUNCTIONS!!!
+     #********************************
+     
+     def DS_WB_to_(self):
+          #**************
+          #DS/WB -> RF/EX
+          #DS/WB -> EX/DF
+          #**************
+          ex_A_UPD = None
+          ex_B_UPD = None
+          rec_1 = None #DF_B sent (is it mem_2B or mem_1B?)
+          if (not self.out_pipeline_st['WB'] or self.out_pipeline_st['WB'].type == 'STALL'): return ex_A_UPD, ex_B_UPD, rec_1
+          potential_forw_WB = self.out_pipeline_st['WB']
+
+          # verify what exactly is needed to be forwarded if I/R type:
+          if ((potential_forw_WB.type == 'I' or potential_forw_WB.type == 'R') and potential_forw_WB.opcode != 'JALR'):
+               if (not self.out_pipeline_st['EX'] or self.out_pipeline_st['EX'].type == 'STALL'): pass
+               else:
+                    potential_forw_EX = self.out_pipeline_st['EX']
+                    if (potential_forw_EX.type in ['I', 'S', 'B', 'R'] and (potential_forw_EX.rs1 == potential_forw_WB.rd)):
+                         ex_A_UPD = self.out_pipeline_regs['DS/WB.ALUout-LMD']
+                         code_replace_1 = (potential_forw_WB.code_out).replace('\t', ' ')
+                         code_replace_2 = (potential_forw_EX.code_out).replace('\t', ' ')
+                         self.out_forw_st['DS/WB -> RF/EX'] = '({}) to ({})'.format(code_replace_1, code_replace_2)
+                         self.out_tot_forw['DS/WB -> RF/EX'] +=1
+                    if (potential_forw_EX.type in ['S', 'B', 'R'] and (potential_forw_EX.rs2 == potential_forw_WB.rd)):
+                         ex_B_UPD = self.out_pipeline_regs['DS/WB.ALUout-LMD']
+                         code_replace_1 = (potential_forw_WB.code_out).replace('\t', ' ')
+                         code_replace_2 = (potential_forw_EX.code_out).replace('\t', ' ')
+                         self.out_forw_st['DS/WB -> RF/EX'] = '({}) to ({})'.format(code_replace_1, code_replace_2)
+                         self.out_tot_forw['DS/WB -> RF/EX'] +=1
+
+               if (not self.out_pipeline_st['DF'] or self.out_pipeline_st['DF'].type == 'STALL'): pass
+               else:
+                    potential_forw_DF = self.out_pipeline_st['DF']
+                    if (potential_forw_DF.type == 'S' and (potential_forw_DF.rs2 == potential_forw_WB.rd)):
+                         rec_1 = self.out_pipeline_regs['DS/WB.ALUout-LMD']
+                         code_replace_1 = (potential_forw_WB.code_out).replace('\t', ' ')
+                         code_replace_2 = (potential_forw_DF.code_out).replace('\t', ' ')
+                         self.out_forw_st['DS/WB -> EX/DF'] = '({}) to ({})'.format(code_replace_1, code_replace_2)
+                         self.out_tot_forw['DS/WB -> EX/DF'] +=1
+               return ex_A_UPD, ex_B_UPD, rec_1
+          else: return ex_A_UPD, ex_B_UPD, rec_1
+          # else we will never need to forward from here (according to ISA)
+         
+
+
+
+     def DF_DS_to_(self):
+          #**************
+          #DF/DS -> RF/EX
+          #DF/DS -> EX/DF
+          #**************
+          ex_A_UPD = None
+          ex_B_UPD = None
+          rec_1 = None #DF_B sent (is it mem_2B or mem_1B?)
+          if (not self.out_pipeline_st['DS'] or self.out_pipeline_st['DS'].type == 'STALL'): return ex_A_UPD, ex_B_UPD, rec_1
+          potential_forw_DS = self.out_pipeline_st['DS']
+          
+          # verify what exactly is needed to be forwarded if I/R type:
+          if ((potential_forw_DS.type == 'I' or potential_forw_DS.type == 'R') and (potential_forw_DS.opcode != 'JALR') and (potential_forw_DS.opcode != 'LW')):
+               if (not self.out_pipeline_st['EX'] or self.out_pipeline_st['EX'].type == 'STALL'): pass
+               else:
+                    potential_forw_EX = self.out_pipeline_st['EX']
+                    if (potential_forw_EX.type in ['I', 'S', 'B', 'R'] and (potential_forw_EX.rs1 == potential_forw_DS.rd)):
+                         ex_A_UPD = self.out_pipeline_regs['DF.ALUout/DS']
+                         code_replace_1 = (potential_forw_DS.code_out).replace('\t', ' ')
+                         code_replace_2 = (potential_forw_EX.code_out).replace('\t', ' ')
+                         self.out_forw_st['DF/DS -> RF/EX'] = '({}) to ({})'.format(code_replace_1, code_replace_2) 
+                         self.out_tot_forw['DF/DS -> RF/EX'] +=1
+                    if (potential_forw_EX.type in ['B', 'R'] and (potential_forw_EX.rs2 == potential_forw_DS.rd)):
+                         ex_B_UPD = self.out_pipeline_regs['DF.ALUout/DS']
+                         code_replace_1 = (potential_forw_DS.code_out).replace('\t', ' ')
+                         code_replace_2 = (potential_forw_EX.code_out).replace('\t', ' ')
+                         self.out_forw_st['DF/DS -> RF/EX'] = '({}) to ({})'.format(code_replace_1, code_replace_2) 
+                         self.out_tot_forw['DF/DS -> RF/EX'] +=1
+
+               if (not self.out_pipeline_st['DF'] or self.out_pipeline_st['DF'].type == 'STALL'): pass
+               else:
+                    potential_forw_DF = self.out_pipeline_st['DF']
+                    if (potential_forw_DF.type == 'S' and (potential_forw_DF.rs2 == potential_forw_DS.rd)):
+                         rec_1 = self.out_pipeline_regs['DF.ALUout/DS']
+                         code_replace_1 = (potential_forw_DS.code_out).replace('\t', ' ')
+                         code_replace_2 = (potential_forw_DF.code_out).replace('\t', ' ')
+                         self.out_forw_st['DF/DS -> EX/DF'] = '({}) to ({})'.format(code_replace_1, code_replace_2)
+                         self.out_tot_forw['DF/DS -> EX/DF'] +=1
+               return ex_A_UPD, ex_B_UPD, rec_1
+          else: return ex_A_UPD, ex_B_UPD, rec_1
+          # else we will never need to forward from here (according to ISA)
+
+
+
+          
+     def EX_DF_to_(self):
+          #**************
+          #EX/DF -> RF/EX
+          #**************
+          ex_A_UPD = None
+          ex_B_UPD = None
+          
+          if (not self.out_pipeline_st['DF'] or self.out_pipeline_st['DF'].type == 'STALL'): return ex_A_UPD, ex_B_UPD
+          potential_forw_DF = self.out_pipeline_st['DF']
+          
+          # verify what exactly is needed to be forwarded if I/R type:
+          if (potential_forw_DF.type == 'I' or potential_forw_DF.type == 'R' and (potential_forw_DF.opcode != 'JALR') and (potential_forw_DF.opcode != 'LW')):
+               if (not self.out_pipeline_st['EX'] or self.out_pipeline_st['EX'].type == 'STALL'): pass
+               else:
+                    potential_forw_EX = self.out_pipeline_st['EX']
+                    if ((potential_forw_EX.type in ['I', 'S', 'B', 'R']) and (potential_forw_EX.rs1 == potential_forw_DF.rd)):
+                         ex_A_UPD = self.out_pipeline_regs['EX/DF.ALUout']
+                         code_replace_1 = (potential_forw_DF.code_out).replace('\t', ' ')
+                         code_replace_2 = (potential_forw_EX.code_out).replace('\t', ' ')
+                         self.out_forw_st['EX/DF -> RF/EX'] = '({}) to ({})'.format(code_replace_1, code_replace_2)
+                         self.out_tot_forw['EX/DF -> RF/EX'] +=1
+                    if (potential_forw_EX.type in ['B', 'R'] and (potential_forw_EX.rs2 == potential_forw_DF.rd)):
+                         ex_B_UPD = self.out_pipeline_regs['EX/DF.ALUout']
+                         code_replace_1 = (potential_forw_DF.code_out).replace('\t', ' ')
+                         code_replace_2 = (potential_forw_EX.code_out).replace('\t', ' ')
+                         self.out_forw_st['EX/DF -> RF/EX'] = '({}) to ({})'.format(code_replace_1, code_replace_2)
+                         self.out_tot_forw['EX/DF -> RF/EX'] +=1
+          return ex_A_UPD, ex_B_UPD
+          # if not I or R type (figure out returns)
+          #else: return ex_A_UPD, ex_B_UPD 
+          # else we will never need to forward from here (according to ISA)
+
+     # END OF FORWARDING FUNCTIONS!!!
+     # ******************************
+
+     # END OF HELPER FUNCTIONS
+     # **************************************
+     
+
+# END OF CLASSES IMPLEMENTATION
+# **************************************
+
+
+
+# function to determine the end of the data memory
+# return the indeces of non-zero elements in memory (at least 10 by default)
+# FIGURE THIS OUT! -- done
+def data_memory_end(memory, length=9):
+     i_list = np.nonzero(memory)
+     data_list = i_list[0]
+
+     if len(data_list) == 0 or data_list[-1] < length: return length
+     else: return data_list[-1]
+
+# just convert instrution objec list to the dictionary
+# all fields are from the used simulator 
+
+def transform(ins_obj_list):
+    full_dict = dict()
+    for ins_obj in ins_obj_list:full_dict[ins_obj.magic_address] = ins_obj
+    return full_dict
+
+# this function allows us to create "stalled" instruction object so we 
+# do not have to manually assign all values
+def call_on_stall():
+     stalled = Instruction('STALL', 'STALL', code_out = 'STALL')
+     return stalled
+
+# equivalent to C signext function
+def sign_extend(val, size):
+     sign_b = 1 << (size - 1)
+     return (val & (sign_b-1)) - (val & sign_b)
+
+def output_current_cycle(stage_carry, loop_pipe_st, can_run):
+     #TODO:
+     # here we will call on all status, regs, mem, forwarding fields
+     # this function will be called from the main (after every cycle is over to print our variables )
+     # to close resemble the output 
+
+
+     output_per_cycle = []
+     
+     #*** PASS THE VARS[i] everywhere for the variables to print out 
+     """
+
+     out_current_pc = vars[0]                                #(PRINT 1)
+     out_pipeline_st = vars[1]                               #(PRINT 2)
+     out_stall_ins = vars[2]                                 #(PRINT 3)
+     out_forw_st = vars[3]                                   #(PRINT 4)
+     out_pipeline_regs = vars[4]                             #(PRINT 5)
+     out_int_regs = vars[5]                                  #(PRINT 6)
+     memory = vars[6]                                        #(PRINT 7)
+     out_tot_stalls = vars[7]                                #(PRINT 8)
+     out_tot_forw = vars[8]                                  #(PRINT 9)
+     out_cycle_count = vars[9]   
+
+     """
+
+     #THE ACTUAL PRINTING INSTRUCTION STARTS BELOW
+     
+     # fix these for the formatting
+     output_per_cycle.append(f'***** Cycle #{stage_carry.out_cycle_count}***********************************************')
+     output_per_cycle.append(f'Current PC = {stage_carry.out_current_pc}:\n')
+
+     #PIPELINE ST PRINT:
+     output_per_cycle.append('Pipeline Status:')
+
+     pipe_stages = ['ID',
+                   'RF',
+                   'EX',
+                   'DF',
+                   'DS',
+                   'WB'
+                    ]
+     
+     """
+
+     TODO: modify the PIPELINE STATUS to 
+          a) output "**STALL**" and "NOP" where there is either a stall or no instruction
+          b) ensure I DO NOT NEED TO USE BINARY STRING FOR IS STAGE
+          c) use LOOP_PIPE_ST everywhere instead of stage_carry.pipe_st !!!!!!!
+
+     """
+
+
+     output_per_cycle.append(f'* IF : <unknown>') # always <unknown>
+
+     # IS done separately for the output just to deal with "Fetched"
+     if not loop_pipe_st['IS']: output_per_cycle.append(f'* IS: NOP')
+     elif loop_pipe_st['IS'].type == 'STALL': output_per_cycle.append(f'* IS : **STALL**')
+     else: 
+          code_replace = (loop_pipe_st["IS"].code_out).replace('\t', ' ')
+          output_per_cycle.append(f'* IS : <Fetched {code_replace}>')
+     
+
+     for i in pipe_stages:
+          if not loop_pipe_st[i]: output_per_cycle.append(f'* {i}: NOP')
+          else: 
+               # this feature below allows us to correctly stop the loop when JALR is in WB
+               if (i == 'WB') :
+                    if('RET' in loop_pipe_st[i].code_out): can_run = False
+                    else:pass
+               else:
+                    code_replace = (loop_pipe_st[i].code_out).replace('\t', ' ')
+                    output_per_cycle.append(f'* {i} : {code_replace}')
+          
+     output_per_cycle.append('\n')
+     #STALL PRINT
+     if not stage_carry.out_stall_ins: output_per_cycle.append(f'Stall Instruction: (none)\n')
+     else: 
+          code_replace = (stage_carry.out_stall_ins.code_out).replace('\t', ' ')
+          output_per_cycle.append(f'Stall Instruction: {code_replace}\n')
+
+     #FORWARDING PRINT:
+     output_per_cycle.append('Forwarding:')
+     if not stage_carry.out_forw_st['Detected']: output_per_cycle.append(' Detected: (none)')
+
+     #to implement the idea of multiple detected instructions for forwarding (just for the output)     
+     else:
+          ins_detected = []
+          for i in stage_carry.out_forw_st['Detected']:
+               src = i["src"]
+               dst = i["dst"]
+               ins_detected.append(f'({src}) to ({dst})')
+          #maintain the list of detected instructions
+          detected_output = "\n\t".join(ins_detected)
+          output_per_cycle.append(f' Detected: {detected_output}')
+     
+     output_per_cycle.append(' Forwarded:')
+
+     forw_items = ['EX/DF -> RF/EX',
+                   'DF/DS -> EX/DF',
+                   'DF/DS -> RF/EX',
+                   'DS/WB -> EX/DF',
+                   'DS/WB -> RF/EX',
+                    ]
+     
+     #FIX THE CODE BELOW BASED ON THE OUTPUT STRINGS THAT HE IS PASSING FROM DECODER
+
+     for i in forw_items:
+          if not stage_carry.out_forw_st[i]:code_out = '(none)'
+          else: code_out = stage_carry.out_forw_st[i]
+          output_per_cycle.append(f'* {i}: {code_out}')
+
+     #PIPELINE REGS PRINT:     
+     output_per_cycle.append('\n')
+     output_per_cycle.append('Pipeline Registers:')
+
+     pipe_regs = ['IF/IS.NPC',
+                  'IS/ID.IR',
+                  'RF/EX.A',
+                  'RF/EX.B',
+                  'EX/DF.ALUout',
+                  'EX/DF.B',
+                  #'DF.ALUout/DS',
+                  #'DF.Extra/DS',
+                  'DS/WB.ALUout-LMD']
+     
+     # for other registers, just call on their actual value in register
+     for i in pipe_regs:
+          pipe_reg_out = str(stage_carry.out_pipeline_regs[i])
+          output_per_cycle.append(f'{i}\t: {pipe_reg_out}')
+          
+     output_per_cycle.append('\n')
+
+     #MAKE SURE THE STUFF BELOW IS CORRECT:
+     #INT REGS PRINT:
+     output_per_cycle.append('Integer registers:')
+     integer_str = ''
+     for i, val in enumerate(stage_carry.out_int_regs):
+          integer_str += f'R{i}\t{val}\t'
+          if (i+1) % 4 == 0: integer_str += '\n'
+     output_per_cycle.append(integer_str)
+     
+     #DATA MEMORY PRINT:
+
+     output_per_cycle.append('Data memory:')
+     last_data_mem = data_memory_end(stage_carry.memory)
+     for x in range(last_data_mem + 1):
+          # x is the index in array of 4 bit words
+          phys_addr = stage_carry.memory.data_address_start + (4 * x)
+          val = stage_carry.memory.data[x]
+          output_per_cycle.append(f'{phys_addr}: {val}')
+
+     output_per_cycle.append('\n')
+     #TOTAL STALLS:
+     output_per_cycle.append('Total Stalls:')
+
+     stall_items = ['Loads',
+                    'Branches',
+                    'Other']
+     for i in stall_items: output_per_cycle.append(f'*{i}: {stage_carry.out_tot_stalls[i]}')
+     output_per_cycle.append('\n')
+
+     #TOTAL FORWARDINGS:
+     output_per_cycle.append('Total Forwardings:')
+
+     for i in forw_items: output_per_cycle.append(f'* {i}: {stage_carry.out_tot_forw[i]}')
+     output_per_cycle.append('\n')
+
+     return output_per_cycle, can_run
+
+# END OF HELPER FUNCTIONS
+# **************************************
+
+# **************************************
+# MAIN FUNCTIONS IMPLEMENTED BELOW (OUTPUT):
+
+# the launch function for simulator execution;
+# all values that start with 'out' are created for the output purposes
+# pass the file output 
+
+
+#TODO: check all registers assignments between stages in the detail!!!
+
+# FIX THE ISSUE: always sees the stage_carry as empty
+
+def launch_sim(full_dict, data_list, fileout):
+
+     #TODO (PRINT THE MEMORY! PRINT INT REGS)
+     data_memory_start, out_current_pc = 600, 496
+     stage_carry = Carry_Stage(data_list, pc_start = out_current_pc, data_memory_start=data_memory_start) 
+     can_run = True
+     ##############################
+
+     # be careful with popping instruction after each loop -- will be problems when stalls are coming in
+     # solution: will need to implement dictionary to access instruction by its address/key in the dict
+     
+     #while (not stage_carry.is_empty())
+     while (((stage_carry.out_current_pc == None) or (not stage_carry.is_empty())) and can_run):    # simulate each cycle
+          
+          #break the loop only if both of them are false (meaning if there are no instructions left and all pipeline 
+          # stages are in None state)
+          stage_carry.assign_forw_st() # this is the example of our change
+          ex_A, ex_B, mem_1A, mem_2A, mem_1B, mem_2B, check_this_flag_first, check_this_flag_second, jump_table_address = None, None, None, None, None, None, False, False, None
+          loop_pipe_st = dict()
+          
+          loop_pipe_st['WB'] = stage_carry.out_pipeline_st['WB'] # created for the output
+          loop_pipe_st['DS'] = stage_carry.out_pipeline_st['DS'] # created for the output
+          loop_pipe_st['DF'] = stage_carry.out_pipeline_st['DF'] # created for the output
+          loop_pipe_st['EX'] = stage_carry.out_pipeline_st['EX'] # created for the output
+          loop_pipe_st['RF'] = stage_carry.out_pipeline_st['RF'] # created for the output
+          loop_pipe_st['ID'] = stage_carry.out_pipeline_st['ID'] # created for the output
+          loop_pipe_st['IS'] = stage_carry.out_pipeline_st['IS'] # created for the output
+          #loop_pipe_st['IF'] = stage_carry.out_pipeline_st['IF'] # created for the output
+          """
+          Debugging: 
+          if stage_carry.out_cycle_count == 1:
+               print('I am stopping an infinite loop!')
+               break
+               
+          """
+
+          
+          #TODO: simulate the cycles  
+          # 
+          # we are adding the string list of those members we need to print for each cycle
+          # we will call output_per_cycle here to format our variables that we are passing from the loop 
+
+          # Reset forw_st before each new cycle (clear the output)
+          # out_forw_st = forwarding_st_init(out_forw_st)
+          # MAKE SURE TO UPDATE PIPELINE_REGS AFTER EACH STAGE IS DONE
+
+          # those passed instruction objects must be moved between each stage as their done IF
+          # there are no stalls on subsequent stages (by doing this we ensure that the whole pipeline
+          # is maintained and we do not start next stage if there is a stall)
+          
+          
+          # WB STAGE ---- DoNe
+          #loop_pipe_st['WB'] = stage_carry.out_pipeline_st['WB'] # created for the output
+          # if instruction is stalled or NONE (check before each stage)
+          if (not stage_carry.out_pipeline_st['WB'] or stage_carry.out_pipeline_st['WB'].type == 'STALL'): pass
+          else:
+               # get the instruction from the pipeline register
+               # take care only of I and R type  (write the res back to reg file)
+
+               ins_now = stage_carry.out_pipeline_st['WB']
+
+               # we are getting the destination of the instruction if it's R type and setting it to ALUOutput
+               # check if instruction is R or I and perform simple assignment on registers
+
+               if ins_now.type in ['R', 'I', 'J']:
+                    # assign rd, value, and integer registers (on the sample output examples)
+                    pipe_reg_index = ins_now.rd # indicates the address of where to store rd
+                    pipe_reg_value = stage_carry.out_pipeline_regs['DS/WB.ALUout-LMD']
+                    stage_carry.out_int_regs[pipe_reg_index] = pipe_reg_value
+                    stage_carry.out_int_regs[0] = 0
+          # FIGURE OUT IF WE HAVE TO REASSIGN THE STAGE IN THE END OF WB
+          # stage_carry.out_pipeline_st['WB'] = stage_carry.out_pipeline_st['DS']
+
+
+          # DS STAGE ---- DoNe assuming forwarding is done!
+          
+          #loop_pipe_st['DS'] = stage_carry.out_pipeline_st['DS'] # created for the output
+          # in here we actually access the values fro the memory
+          # add extra mem_1A and mem_1B (to actually access the values from memory)
+           ### CHECK THESE FOR MEM1/MEM2 confusion and EX
+
+          ex_A_UPD, ex_B_UPD, rec_1 = stage_carry.DS_WB_to_()
+          if ex_A_UPD is not None: ex_A = ex_A_UPD
+          if ex_B_UPD is not None: ex_B = ex_B_UPD
+          if rec_1 is not None: mem_2B = rec_1
+
+          # if instruction is stalled or NONE (check before each stage)
+          if (not stage_carry.out_pipeline_st['DS'] or stage_carry.out_pipeline_st['DS'].type == 'STALL'):
+               stage_carry.out_pipeline_regs['DS/WB.ALUout-LMD'] = 0
+          else:
+               # update the state and actually load our results ()
+
+              
+               ins_now = stage_carry.out_pipeline_st['DS']
+               mem_1A = stage_carry.out_pipeline_regs['DF.ALUout/DS']
+               mem_1B = stage_carry.out_pipeline_regs['DF.Extra/DS']
+
+               """#DEBUGGING:
+               print("This is mem_1A\n")
+               print (mem_1A)
+               print("This is mem_1B\n")
+               print (mem_1B)
+               """
+
+               # using the address of that mem_A variable that we have, load instr
+               if ins_now.opcode == 'LW': mem_1A = stage_carry.memory.load(mem_1A)
+               # store at the address mem_A: value mem_B
+               elif ins_now.opcode == 'SW': stage_carry.memory.store(mem_1B, mem_1A)
+               elif ins_now.opcode == 'JAL' or ins_now.opcode == 'JALR': mem_1A = ins_now.magic_address + 4 
+               else: pass
+                    # move the computation result to the WB stage (only for R, I (ADDI and SLTI))
+                    # from mem_1A to DS/WB/ALUout-LMD 
+     
+               """
+                    For the jump instruction above  ^^^^, there is an error in the
+                    sample output (they write back the old/target address); however, 
+                    in RISC-V, JAL writes back PC+4, so we do the same according to instruction set.
+
+               """
+               stage_carry.out_pipeline_regs['DS/WB.ALUout-LMD'] = mem_1A
+          # remember to move stage as "after we just send the values to the stage"
+          stage_carry.out_pipeline_st['WB'] = stage_carry.out_pipeline_st['DS']
+
+
+          # DF STAGE ---- DoNe
+          #loop_pipe_st['DF'] = stage_carry.out_pipeline_st['DF'] # created for the output
+          # here have to update 4 stages above and set their type to "STALL" before further proceeding 
+          # here we just forward, update the memory values
+          # add extra mem_2A and mem_2B (just to compute the values/forward)
+
+          #### CHECK THESE VALUES
+          ex_A_UPD, ex_B_UPD, rec_1 = stage_carry.DF_DS_to_()
+          if ex_A_UPD is not None: ex_A = ex_A_UPD
+          if ex_B_UPD is not None: ex_B = ex_B_UPD
+          if rec_1 is not None: mem_2B = rec_1
+
+          # NOT VALID - NO FORWARDING.
+          if (not stage_carry.out_pipeline_st['DF'] or stage_carry.out_pipeline_st['DF'].type == 'STALL'):
+               stage_carry.out_pipeline_regs['DF.ALUout/DS'] = 0
+               stage_carry.out_pipeline_regs['DF.Extra/DS'] = 0
+          
+          else:
+               # check forwarding DF/DS -> EX/DF (1 stage back)
+               # and check the second one DS/WB -> EX/DF (2 stages back)
+               # used mainly for the store instructions
+
+     
+               # get the registers from the previous stage (from pipeline regsters after we moved the stage state)
+               ins_now = stage_carry.out_pipeline_st['DF']
+               mem_2A = stage_carry.out_pipeline_regs['EX/DF.ALUout']
+
+               # verify where memory B (on DF) is, if we did not forward it, get it from the register
+               # for S type (on the STORE we keep rs2)
+               if not mem_2B: mem_2B = stage_carry.out_pipeline_regs['EX/DF.B']
+
+               """
+               # we only care about store/load
+               if ins_now.name == 'LW':
+                    load_address = stage_carry.out_pipeline_regs['EX/DF.ALUout']
+                    load_value = stage_carry.memory.load(load_address)
+                    stage_carry.out_pipeline_regs['DF.ALUOut/DS'] = load_value
+
+               #store
+               elif ins_now.name == 'SW':
+                    store_address = stage_carry.out_pipeline_regs['EX/DF.ALUout']
+                    store_value = stage_carry.out_pipeline_regs['EX/DF.B']
+                    stage_carry.memory.store(store_value, store_address)
+
+                    # figure out this line below: 
+                    stage_carry.out_pipeline_regs['DF.ALUOut/DS'] = 0
+               else:
+                    stage_carry.out_pipeline_regs['DF.ALUOut/DS'] = 0
+
+               """
+
+               #!!! update the registers (if we actually got the value, store address and value)
+               # move the computation result to the WB stage (only for R, I (ADDI and SLTI))
+               # from mem_2A to DF/DS 
+               
+               stage_carry.out_pipeline_regs['DF.ALUout/DS'] = mem_2A
+               stage_carry.out_pipeline_regs['DF.Extra/DS'] = mem_2B
+
+          # remember to move stage as "after we just send the values to the stage"
+          stage_carry.out_pipeline_st['DS'] = stage_carry.out_pipeline_st['DF']
+
+
+          # EX STAGE ---- DoNe
+          #loop_pipe_st['EX'] = stage_carry.out_pipeline_st['EX'] # created for the output
+
+          ### CHECK THESE FOR MEM1/MEM2 confusion and EX
+          ex_A_UPD, ex_B_UPD = stage_carry.EX_DF_to_()
+          if ex_A_UPD is not None: ex_A = ex_A_UPD
+          if ex_B_UPD is not None: ex_B = ex_B_UPD
+
+          if (not stage_carry.out_pipeline_st['EX'] or stage_carry.out_pipeline_st['EX'].type == 'STALL'):
+               # just clear out the registers if None or Stall (implement on every stage)
+               stage_carry.out_pipeline_regs['EX/DF.ALUout'] = 0
+               stage_carry.out_pipeline_regs['EX/DF.B'] = 0
+               stage_carry.out_pipeline_st['DF'] = stage_carry.out_pipeline_st['EX']
+          
+          else:
+               ins_now = stage_carry.out_pipeline_st['EX']
+               # simply assign the value right now from the register of the prev stage
+               if not ex_A: ex_A = stage_carry.out_pipeline_regs['RF/EX.A']
+               if not ex_B: ex_B = stage_carry.out_pipeline_regs['RF/EX.B']
+               check_this_flag_first= stage_carry.if_taken(ex_A, ex_B)
+
+               #if ins_now.type == 'R': ex_A = ex_A + ex_B
+               
+               # R-type ALU operations
+               if ins_now.type == 'R':
+                    if ins_now.opcode == 'SLT':
+                         if ex_A < ex_B: ex_A = 1
+                         else: ex_A = 0
+                    elif ins_now.opcode == 'SLL': ex_A = ex_A << ex_B
+                    elif ins_now.opcode == 'SRL': ex_A = ex_A  >> u(ex_B)
+                    elif ins_now.opcode == 'SUB': ex_A = ex_A - ex_B
+                    elif ins_now.opcode == 'ADD': ex_A = ex_A + ex_B
+                    elif ins_now.opcode == 'AND': ex_A = ex_A & ex_B
+                    elif ins_now.opcode == 'OR':  ex_A = ex_A | ex_B
+                    elif ins_now.opcode == 'XOR': ex_A = ex_A ^ ex_B
+                    else: pass
+
+               elif ins_now.type == 'I':
+                    if ins_now.opcode == 'JALR':   ex_A = ex_A + ins_now.imm
+                    elif ins_now.opcode == 'ADDI': ex_A = ex_A + ins_now.imm
+                    elif ins_now.opcode == 'SLTI':
+                         # immediate values are 12 bits for I-type
+                         if ex_A < sign_extend(ins_now.imm, 12): ex_A = 1
+                         else: ex_A = 0
+                    elif ins_now.opcode == 'LW': ex_A = ex_A + ins_now.imm
+                    else: pass
+               elif ins_now.type == 'S': ex_A = ex_A + ins_now.imm
+               elif ins_now.type == 'B' or ins_now.type == 'J': ex_A = ins_now.magic_address + ins_now.imm
+               else: pass
+               stage_carry.out_pipeline_regs['EX/DF.ALUout'] = ex_A
+               stage_carry.out_pipeline_regs['EX/DF.B'] = ex_B
+          
+               """
+               # !!! right here in the end update pipeline regs (save what we got in the output to the register)
+               # WORKSPACE: 
+               # TODO: implement the calculation -- done
+               """
+               
+          # we should store instruction's "magical physical address " in the instruction class (like that J #520 is at address 552)
+          # remember to move stage as "after we just send the values to the stage"
+          stage_carry.out_pipeline_st['DF'] = stage_carry.out_pipeline_st['EX']
+          
+          if check_this_flag_first:
+               jump_table_address = ex_A
+               # for the stalling/jumping 
+               # where to put this jumping detection
+               # 4 bubbles if branch is taken
+               stage_carry.out_pipeline_st['EX'] = call_on_stall()
+               stage_carry.out_pipeline_st['RF'] = call_on_stall()
+               stage_carry.out_pipeline_st['ID'] = call_on_stall()
+               stage_carry.out_pipeline_st['IS'] = call_on_stall()
+               #jump_table_address = where_jump()
+               
+          
+          # RF STAGE
+          #loop_pipe_st['RF'] = stage_carry.out_pipeline_st['RF'] # created for the output
+          if (not stage_carry.out_pipeline_st['RF'] or stage_carry.out_pipeline_st['RF'].type == 'STALL'):
+               # just clear out the registers if None or Stall (implement on every stage)
+               stage_carry.out_pipeline_regs['RF/EX.A'] = 0
+               stage_carry.out_pipeline_regs['RF/EX.B'] = 0
+               
+          else: 
+               ins_now = stage_carry.out_pipeline_st['RF']
+               if ins_now.type == 'I': rf_A, rf_B = stage_carry.out_int_regs[ins_now.rs1], stage_carry.out_int_regs[ins_now.rd]
+               elif ins_now.type == 'S' or ins_now.type == 'B' or ins_now.type == 'R': rf_A, rf_B = stage_carry.out_int_regs[ins_now.rs1], stage_carry.out_int_regs[ins_now.rs2]
+               elif ins_now.type == 'J' or ins_now.type == 'B': rf_A, rf_B = 0, stage_carry.out_int_regs[ins_now.rd] 
+               else: rf_A, rf_B = 0, 0 # if unknown
+
+               stage_carry.out_pipeline_regs['RF/EX.A'] = rf_A
+               stage_carry.out_pipeline_regs['RF/EX.B'] = rf_B
+               # we have to access the register file in here (load the regs)
+               #TODO: implement the actual stage! 
+          
+          # remember to move stage as "after we just send the values to the stage"
+          stage_carry.out_pipeline_st['EX'] = stage_carry.out_pipeline_st['RF']
+
+          
+          # ID STAGE
+          #loop_pipe_st['ID'] = stage_carry.out_pipeline_st['ID'] # created for the output
+
+          # stall flag (for the next instructions IS, IF) -- they must not proceed if ID just detected the hazard
+          # so if they see check_this_flag is True, I pass (since it is stalled)
+          
+
+          if (not stage_carry.out_pipeline_st['ID'] or stage_carry.out_pipeline_st['ID'].type == 'STALL'): 
+               # just clear out the registers if None or Stall (implement on every stage)
+               # if there is a stall or no valid
+               stage_carry.out_pipeline_st['RF'] = stage_carry.out_pipeline_st['ID']
+          else:
+               ins_now = stage_carry.out_pipeline_st['ID']
+               check_this_flag_second = stage_carry.hazard_UNIT()
+               if check_this_flag_second: 
+                    # here if we see that next instruction in the pipeline is stalled, create stalled object
+                    # and update the NPC since we moved it forward!
+                    stage_carry.out_pipeline_st['RF'] = call_on_stall()
+                    stage_carry.out_stall_ins = ins_now
+                    stage_carry.out_pipeline_regs['IF/IS.NPC'] -= 4 # account for simple implementation for IF
+               else:
+                    # we have to send the binary string (RISC code) of an instruction from the parser
+                    # detect hazards, forwarding, and stalls 
+                    #TODO: implement the actual stage!
+                    # if it is valid but no stall
+                    stage_carry.out_stall_ins = None
+                    stage_carry.out_pipeline_st['RF'] = stage_carry.out_pipeline_st['ID']
+                    # ^^^^ why is it not outside of the loop as in other stages
+
+          # remember to move stage as "after we just send the values to the stage"
+          
+
+          # IS STAGE
+          #loop_pipe_st['IS'] = stage_carry.out_pipeline_st['IS'] # created for the output
+
+          if (not stage_carry.out_pipeline_st['IS'] or stage_carry.out_pipeline_st['IS'].type == 'STALL'): 
+               stage_carry.out_pipeline_st['ID'] = stage_carry.out_pipeline_st['IS']
+     
+          else:
+               ins_now = stage_carry.out_pipeline_st['IS'] ### DO WE NEED THIS UPDATE?
+               stage_carry.out_pipeline_regs['IS/ID.IR'] = ins_now.code_out
+               # check_this_flag = False
+               # finish fetch (basically wait for another cycle)
+               #TODO: implement the actual stage!
+               # remember to move stage as "after we just send the values to the stage"
+               if check_this_flag_second: pass #do not go to the next ID
+               else: stage_carry.out_pipeline_st['ID'] = stage_carry.out_pipeline_st['IS']
+
+           
+          # IF STAGE ---- DoNe (assuming no forwarding)
+
+          stage_carry.out_current_pc = stage_carry.out_pipeline_regs['IF/IS.NPC'] #----- add this item to the stage carry
+          if stage_carry.out_current_pc in full_dict: ins_now = full_dict[stage_carry.out_current_pc] #---- after you update the PC, fetch that instruction that we just got
+          else:ins_now = None
+          
+          #don't set the new PC (for the jumping --- update to the target address)
+          if check_this_flag_first: pass
+          else:
+               # remember to move stage as "after we just send the values to the stage"
+               # stage_carry.out_pipeline_st['IS'] = stage_carry.out_current_pc
+               # HAVE TO UPDATE THE INSTRUCTION LIST TO DICTIONARY TO ACCESS IT BY ADDRESS AS KEY, so:
+               stage_carry.out_pipeline_st['IS'] = ins_now # we set the instruction for IS of the one we just got after updated NPC
+          stage_carry.out_pipeline_regs['IF/IS.NPC'] = stage_carry.out_current_pc + 4
+          
+          """
+          if not stage_carry.out_pipeline_st['IF'] or cur_ins.type == 'STALL':
+               stage_carry.out_pipeline_regs[RF/EX.A] = 0
+               stage_carry.out_pipeline_regs[RF/EX.B] = 0
+               
+          else:
+               check_this_flag = False
+               # check for the NPC and fetch the next instruction (state of the stage is always <unknown>)
+               #TODO: implement the actual stage!
+          """
+           
+          out_per_cycle, can_run = output_current_cycle(stage_carry, loop_pipe_st, can_run)     # main_output contains the whole output for the simulator
+          # append each cycle to the output file
+          write_file(fileout, out_per_cycle, 'a')
+
+          stage_carry.out_cycle_count += 1 # update the cycle counter
+
+          # output prints for branch and load stalls below:
+          if check_this_flag_first:
+               stage_carry.out_tot_stalls['Branches'] += 4
+               stage_carry.out_pipeline_regs['IF/IS.NPC'] = jump_table_address
+
+          if check_this_flag_second: 
+               stage_carry.out_tot_stalls['Loads'] += 1
+
+          
+         
+     
+          
+          
+
+# END OF MAIN FUNCTIONS
+# **************************************
+        
+if __name__ == "__main__":
+    
+     input_filename = input("Enter input_filename: ")
+     output_filename = input("Enter output_filename: ")
+     operation = input('Enter operation (dis/sim):')
+
+     # process the input file
+     lines = read_file(input_filename)
+
+     if operation == 'dis':
+
+          # (...insert from disassembler)
+          # get two return values from decode_whole_file linees
+          # call on outpt str list = get_output string list
+          # Decode all lines in a file
+
+          # can I change this var names to easier process throughout the code?
+          ins_obj_list, data_list, data_output_str_list = decode_whole_file_lines(lines, address=496, data_str_list=True)
+          output_str_list = get_output_str_list(ins_obj_list, data_output_str_list)
+
+          # Write output 
+          write_file(output_filename, output_str_list)
+          print('I disassembled it.\n')
+
+     #adding the option for the simulator to run with "sim"
+     elif operation == 'sim':
+          # get three return values from decode_whole_files lines
+          # call on output str line = simulate_whole_file_lines(instrlist, datalist)
+
+          # decode all lines in a file first
+          ins_obj_list, data_list = decode_whole_file_lines(lines, address=496)
+
+          # start writing into the file (write mode):
+          write_file(output_filename, ['***** RISC-V SIMULATOR *****: \n'], 'w')
+
+          #TODO: implement list conversion to dictionary  --- DONE
+          full_dict = transform(ins_obj_list)
+
+          # Simulate all lines in a file
+          launch_sim(full_dict, data_list, output_filename)
+          #launch_sim(ins_obj_list, data_list, output_filename)
+          print('I simulated it.\n')
+          
+     else:
+          #wrong command
+          print('Wrong command issued.\n')
+    
